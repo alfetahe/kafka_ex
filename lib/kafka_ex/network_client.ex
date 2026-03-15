@@ -54,40 +54,21 @@ defmodule KafkaEx.NetworkClient do
 
   @impl true
   def send_sync_request(%{:socket => socket} = broker, data, timeout) do
-    :ok = Socket.setopts(socket, [:binary, {:packet, 4}, {:active, false}])
+    with :ok <- Socket.setopts(socket, [:binary, {:packet, 4}, {:active, false}]),
+         :ok <- Socket.send(socket, data),
+         {:ok, data} <- Socket.recv(socket, 0, timeout) do
+      :ok = Socket.setopts(socket, [:binary, {:packet, 4}, {:active, true}])
+      data
+    else
+      {_, reason} ->
+        Logger.log(
+          :error,
+          "Network error with broker #{inspect(broker.host)}:#{inspect(broker.port)}: #{inspect(reason)}"
+        )
 
-    response =
-      case Socket.send(socket, data) do
-        :ok ->
-          case Socket.recv(socket, 0, timeout) do
-            {:ok, data} ->
-              :ok = Socket.setopts(socket, [:binary, {:packet, 4}, {:active, true}])
-
-              data
-
-            {:error, reason} ->
-              Logger.log(
-                :error,
-                "Receiving data from broker #{inspect(broker.host)}:#{inspect(broker.port)} failed with #{inspect(reason)}"
-              )
-
-              Socket.close(socket)
-
-              {:error, reason}
-          end
-
-        {_, reason} ->
-          Logger.log(
-            :error,
-            "Sending data to broker #{inspect(broker.host)}:#{inspect(broker.port)} failed with #{inspect(reason)}"
-          )
-
-          Socket.close(socket)
-
-          {:error, reason}
-      end
-
-    response
+        Socket.close(socket)
+        {:error, reason}
+    end
   end
 
   def send_sync_request(nil, _, _) do
