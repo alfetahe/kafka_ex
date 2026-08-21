@@ -105,17 +105,34 @@ defmodule KafkaEx.Network.NetworkClient do
   end
 
   @impl true
-  def send_sync_request(%{socket: nil}, _data, _timeout) do
+  def send_sync_request(broker, data, timeout), do: do_send_sync_request(broker, data, timeout, nil, nil)
+
+  @doc """
+  Sends `data` and reads frames until the one carrying `correlation_id`.
+
+  Frames read before it are the responses of requests pipelined earlier on the
+  same socket: each is passed to `on_earlier_frame` in connection order, so the
+  caller can route it to its own requester. Use this instead of
+  `send_sync_request/3` whenever the socket has pipelined requests
+  outstanding — the passive read would otherwise return their responses.
+  """
+  @spec send_sync_request_pipelined(map() | nil, iodata(), timeout(), integer(), (binary() -> any())) ::
+          binary() | {:error, any()}
+  def send_sync_request_pipelined(broker, data, timeout, correlation_id, on_earlier_frame) do
+    do_send_sync_request(broker, data, timeout, correlation_id, on_earlier_frame)
+  end
+
+  defp do_send_sync_request(%{socket: nil}, _data, _timeout, _correlation_id, _on_earlier_frame) do
     {:error, :not_connected}
   end
 
-  def send_sync_request(%{:socket => socket} = broker, data, timeout) do
+  defp do_send_sync_request(%{:socket => socket} = broker, data, timeout, correlation_id, on_earlier_frame) do
     case Socket.setopts(socket, [:binary, {:packet, 4}, {:active, false}]) do
       :ok ->
         response =
           case Socket.send(socket, data) do
             :ok ->
-              receive_response(socket, timeout, broker)
+              receive_response(socket, timeout, broker, correlation_id, on_earlier_frame)
 
             {_, reason} ->
               broker_str = inspect_broker(broker.host, broker.port)
@@ -134,15 +151,20 @@ defmodule KafkaEx.Network.NetworkClient do
     end
   end
 
-  def send_sync_request(nil, _, _) do
+  defp do_send_sync_request(nil, _, _, _correlation_id, _on_earlier_frame) do
     {:error, :no_broker}
   end
 
-  defp receive_response(socket, timeout, broker) do
+  defp receive_response(socket, timeout, broker, correlation_id, on_earlier_frame) do
     case Socket.recv(socket, 0, timeout) do
       {:ok, data} ->
-        :ok = Socket.setopts(socket, [:binary, {:packet, 4}, {:active, true}])
-        data
+        if own_response?(data, correlation_id) do
+          :ok = Socket.setopts(socket, [:binary, {:packet, 4}, {:active, true}])
+          data
+        else
+          on_earlier_frame.(data)
+          receive_response(socket, timeout, broker, correlation_id, on_earlier_frame)
+        end
 
       {:error, :timeout} ->
         Logger.error("Receiving data from #{inspect_broker(broker.host, broker.port)} timed out")
@@ -155,6 +177,12 @@ defmodule KafkaEx.Network.NetworkClient do
         {:error, reason}
     end
   end
+
+  # Every Kafka response opens with the correlation id of its request. Without
+  # pipelining the first frame is always the answer, so no id is asked for.
+  defp own_response?(_data, nil), do: true
+  defp own_response?(<<correlation_id::32-signed, _rest::binary>>, correlation_id), do: true
+  defp own_response?(_data, _correlation_id), do: false
 
   @impl true
   def format_host(host) do

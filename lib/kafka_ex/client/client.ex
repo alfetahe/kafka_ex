@@ -56,6 +56,25 @@ defmodule KafkaEx.Client do
     GenServer.call(server, {:kayrock_request, request, node_selector}, timeout_val(timeout))
   end
 
+  @doc """
+  Send a Kayrock request without waiting for its response.
+
+  Returns `{:ok, ref}` once the request is on the wire; the response reaches the
+  calling process later as `{:kafka_ex_response, ref, result}`, `result` being
+  `{:ok, response}` or `{:error, reason}`. Several requests may be outstanding
+  on one broker connection at a time — the broker answers them in the order it
+  received them, and a frame that does not carry the oldest outstanding
+  request's correlation id closes the connection and fails everything
+  outstanding on it rather than answering the wrong request.
+
+  No timer is kept for an outstanding request: the caller owns the timeout.
+  """
+  @spec send_request_async(KafkaEx.API.client(), map, KafkaEx.Client.NodeSelector.t(), pos_integer | nil) ::
+          {:ok, reference} | {:error, term}
+  def send_request_async(server, request, node_selector, timeout \\ nil) do
+    GenServer.call(server, {:kayrock_request_async, request, node_selector}, timeout_val(timeout))
+  end
+
   require Logger
 
   # Default from GenServer
@@ -337,6 +356,12 @@ defmodule KafkaEx.Client do
     {:reply, response, updated_state}
   end
 
+  def handle_call({:kayrock_request_async, request, node_selector}, {caller, _tag}, state) do
+    {response, updated_state} = kayrock_network_request_async(request, node_selector, caller, state)
+
+    {:reply, response, updated_state}
+  end
+
   # Simple handler for consumer group name retrieval
   def handle_call(:consumer_group, _from, state) do
     {:reply, state.consumer_group_for_auto_commit, state}
@@ -349,14 +374,26 @@ defmodule KafkaEx.Client do
     {:noreply, update_metadata_with_retry(state, @max_metadata_update_retries)}
   end
 
+  def handle_info({:tcp, socket, frame}, state) do
+    {:noreply, route_frame(state, socket, frame)}
+  end
+
+  def handle_info({:ssl, socket, frame}, state) do
+    {:noreply, route_frame(state, socket, frame)}
+  end
+
   def handle_info({:tcp_closed, socket}, state) do
-    state_out = close_broker_by_socket(state, socket)
-    {:noreply, state_out}
+    {:noreply, state |> close_broker_by_socket(socket) |> fail_pending(socket, :closed)}
   end
 
   def handle_info({:ssl_closed, socket}, state) do
-    state_out = close_broker_by_socket(state, socket)
-    {:noreply, state_out}
+    {:noreply, state |> close_broker_by_socket(socket) |> fail_pending(socket, :closed)}
+  end
+
+  # A synchronous read past pipelined responses lost the socket; the requests
+  # still registered on it will never be answered.
+  def handle_info({:kafka_ex_pipeline_failed, socket, reason}, state) do
+    {:noreply, fail_pending(state, socket, reason)}
   end
 
   defp update_metadata_with_retry(_state, retries_left) when retries_left <= 0 do
@@ -394,7 +431,11 @@ defmodule KafkaEx.Client do
         {updated_cluster_metadata, brokers_to_close} =
           ClusterMetadata.merge_brokers(updated_state.cluster_metadata, new_cluster_metadata)
 
-        :ok = Enum.each(brokers_to_close, &NetworkClient.close_socket(&1, &1.socket, :metadata_update))
+        updated_state =
+          Enum.reduce(brokers_to_close, updated_state, fn broker, acc ->
+            NetworkClient.close_socket(broker, broker.socket, :metadata_update)
+            fail_pending(acc, broker.socket, :closed)
+          end)
 
         state_with_meta = %{updated_state | cluster_metadata: updated_cluster_metadata}
         updated_state = State.update_brokers(state_with_meta, &maybe_connect_broker(&1, state))
@@ -1076,24 +1117,26 @@ defmodule KafkaEx.Client do
     end
   end
 
-  defp first_broker_response(request, brokers, timeout) do
-    first_broker_response(request, Enum.shuffle(brokers), timeout, nil)
+  defp first_broker_response(request, correlation_id, brokers, timeout, pipelined) do
+    first_broker_response(request, correlation_id, Enum.shuffle(brokers), timeout, pipelined, nil)
   end
 
-  defp first_broker_response(_request, [], _timeout, last_error) do
+  defp first_broker_response(_request, _correlation_id, [], _timeout, _pipelined, last_error) do
     {last_error || {:error, :no_connected_broker}, nil}
   end
 
-  defp first_broker_response(request, [broker | rest], timeout, _last_error) do
-    case try_broker(broker, request, timeout) do
-      nil -> first_broker_response(request, rest, timeout, {:error, :broker_failed})
-      {:error, _} = error -> first_broker_response(request, rest, timeout, error)
+  defp first_broker_response(request, correlation_id, [broker | rest], timeout, pipelined, _last_error) do
+    case try_broker(broker, request, correlation_id, timeout, pipelined) do
+      nil -> first_broker_response(request, correlation_id, rest, timeout, pipelined, {:error, :broker_failed})
       response -> {response, broker}
     end
   end
 
-  defp try_broker(broker, request, timeout) do
-    case NetworkClient.send_sync_request(broker, request, timeout) do
+  defp try_broker(broker, request, correlation_id, timeout, pipelined) do
+    send_request = send_sync_request_fn(broker, timeout, raw_socket(broker.socket) in pipelined)
+    {result, _broker} = send_request.(request, correlation_id)
+
+    case result do
       {:error, :not_connected} ->
         Logger.debug("#{Broker.to_string(broker)} not connected, skipping")
         nil
@@ -1165,6 +1208,76 @@ defmodule KafkaEx.Client do
     end
   end
 
+  # Puts a request on the wire and registers it against the broker's socket.
+  # `route_frame/3` reads the response off the active socket and hands it to
+  # `caller`; nothing here waits for it.
+  defp kayrock_network_request_async(request, node_selector, caller, state) do
+    case resolve_broker(node_selector, state) do
+      {nil, updated_state} ->
+        {{:error, :no_broker}, updated_state}
+
+      {{:error, _} = error, updated_state} ->
+        {error, updated_state}
+
+      {broker, updated_state} ->
+        client_request = client_request(request, updated_state)
+        wire_request = @protocol.serialize_request(client_request)
+        updated_state = State.increment_correlation_id(updated_state)
+
+        case NetworkClient.send_async_request(broker, wire_request) do
+          :ok ->
+            entry = %{
+              correlation_id: client_request.correlation_id,
+              ref: make_ref(),
+              caller: caller,
+              request: client_request
+            }
+
+            {{:ok, entry.ref}, State.push_pending(updated_state, broker.socket, entry)}
+
+          {:error, _} = error ->
+            {error, updated_state}
+
+          reason ->
+            {{:error, reason}, updated_state}
+        end
+    end
+  end
+
+  # The broker answers a connection's requests in the order it received them,
+  # so the frame belongs to the oldest request outstanding on this socket. A
+  # correlation id that says otherwise means the stream is out of step: close
+  # it rather than hand a response to the wrong request.
+  defp route_frame(state, socket, frame) do
+    case State.peek_pending(state, socket) do
+      nil ->
+        Logger.warning("Discarding a #{byte_size(frame)}-byte frame: no request is outstanding on this connection")
+
+        state
+
+      %{correlation_id: correlation_id} = entry ->
+        if match?(<<^correlation_id::32-signed, _rest::binary>>, frame) do
+          send(entry.caller, {:kafka_ex_response, entry.ref, deserialize(frame, entry.request)})
+          State.drop_pending(state, socket)
+        else
+          Logger.error(
+            "Response frame does not carry the oldest outstanding correlation id " <>
+              "(#{correlation_id}); closing the connection"
+          )
+
+          state
+          |> close_broker_by_socket(socket, :correlation_mismatch)
+          |> fail_pending(socket, :correlation_mismatch)
+        end
+    end
+  end
+
+  defp fail_pending(state, socket, reason) do
+    {entries, updated_state} = State.take_pending(state, socket)
+    Enum.each(entries, &send(&1.caller, {:kafka_ex_response, &1.ref, {:error, reason}}))
+    updated_state
+  end
+
   defp kayrock_network_request(request, node_selector, state, network_timeout \\ nil) do
     synchronous = if Map.get(request, :acks) == 0, do: false, else: true
     network_timeout = config_sync_timeout(network_timeout)
@@ -1203,7 +1316,7 @@ defmodule KafkaEx.Client do
     bytes_sent = IO.iodata_length(wire_request)
 
     {result, bytes_received, broker_info} =
-      case send_request.(wire_request) do
+      case send_request.(wire_request, client_request.correlation_id) do
         {{:error, reason}, broker} ->
           {{:error, reason}, 0, broker_to_telemetry_info(broker)}
 
@@ -1225,74 +1338,90 @@ defmodule KafkaEx.Client do
     if Enum.empty?(connected_brokers) do
       {:no_broker, updated_state}
     else
-      {fn wire_request -> first_broker_response(wire_request, connected_brokers, network_timeout) end, updated_state}
+      pipelined = State.pending_sockets(updated_state)
+
+      {fn wire_request, correlation_id ->
+         first_broker_response(wire_request, correlation_id, connected_brokers, network_timeout, pipelined)
+       end, updated_state}
     end
   end
 
-  defp get_send_request_function(
-         %NodeSelector{strategy: :topic_partition, topic: topic, partition: partition},
-         state,
-         network_timeout,
-         synchronous
-       ) do
-    {broker, updated_state} = broker_for_partition_with_update(state, topic, partition)
+  defp get_send_request_function(%NodeSelector{} = node_selector, state, network_timeout, synchronous) do
+    case resolve_broker(node_selector, state) do
+      {nil, updated_state} ->
+        {:no_broker, updated_state}
 
-    if broker do
-      if synchronous do
-        {send_sync_request_fn(broker, network_timeout), updated_state}
-      else
-        {send_async_request_fn(broker), updated_state}
-      end
-    else
-      {:no_broker, updated_state}
-    end
-  end
+      {{:error, _} = error, updated_state} ->
+        {error, updated_state}
 
-  defp get_send_request_function(
-         %NodeSelector{
-           strategy: :consumer_group,
-           consumer_group_name: consumer_group
-         },
-         state,
-         network_timeout,
-         _synchronous
-       ) do
-    {broker, updated_state} = broker_for_consumer_group_with_update(state, consumer_group)
-
-    if broker do
-      {send_sync_request_fn(broker, network_timeout), updated_state}
-    else
-      {:no_broker, updated_state}
-    end
-  end
-
-  defp get_send_request_function(%NodeSelector{} = node_selector, state, network_timeout, _synchronous) do
-    case State.select_broker(state, node_selector) do
-      {:ok, broker} ->
-        {connected_broker, updated_state} = ensure_broker_connected(broker, state)
-
-        if connected_broker do
-          {send_sync_request_fn(connected_broker, network_timeout), updated_state}
+      {broker, updated_state} ->
+        if synchronous do
+          {send_sync_request_fn(broker, network_timeout, State.pending?(updated_state, broker.socket)), updated_state}
         else
-          {:no_broker, updated_state}
+          {send_async_request_fn(broker), updated_state}
         end
-
-      {:error, _} = error ->
-        {error, state}
     end
   end
 
-  defp send_sync_request_fn(broker, network_timeout) do
-    fn wire_request ->
+  # Resolves the one broker a request targets, connecting and refreshing
+  # metadata as needed; `nil` means none is usable. `:first_available` has no
+  # single target and races the request across every connected broker instead.
+  defp resolve_broker(%NodeSelector{strategy: :topic_partition, topic: topic, partition: partition}, state) do
+    broker_for_partition_with_update(state, topic, partition)
+  end
+
+  defp resolve_broker(%NodeSelector{strategy: :consumer_group, consumer_group_name: consumer_group}, state) do
+    broker_for_consumer_group_with_update(state, consumer_group)
+  end
+
+  defp resolve_broker(%NodeSelector{} = node_selector, state) do
+    case State.select_broker(state, node_selector) do
+      {:ok, broker} -> ensure_broker_connected(broker, state)
+      {:error, _} = error -> {error, state}
+    end
+  end
+
+  defp send_sync_request_fn(broker, network_timeout, false = _pipelined?) do
+    fn wire_request, _correlation_id ->
       {NetworkClient.send_sync_request(broker, wire_request, network_timeout), broker}
     end
   end
 
+  # Requests are already outstanding on this socket, so the passive read would
+  # return their responses. Read past them, handing each back to this process in
+  # connection order so `route_frame/3` still delivers it to its own requester.
+  defp send_sync_request_fn(broker, network_timeout, true = _pipelined?) do
+    client = self()
+    socket = raw_socket(broker.socket)
+    tag = if broker.socket.ssl, do: :ssl, else: :tcp
+
+    fn wire_request, correlation_id ->
+      result =
+        NetworkClient.send_sync_request_pipelined(
+          broker,
+          wire_request,
+          network_timeout,
+          correlation_id,
+          &send(client, {tag, socket, &1})
+        )
+
+      case result do
+        {:error, reason} -> send(client, {:kafka_ex_pipeline_failed, socket, reason})
+        _frame -> :ok
+      end
+
+      {result, broker}
+    end
+  end
+
   defp send_async_request_fn(broker) do
-    fn wire_request ->
+    fn wire_request, _correlation_id ->
       {NetworkClient.send_async_request(broker, wire_request), broker}
     end
   end
+
+  defp raw_socket(nil), do: nil
+  defp raw_socket(%KafkaEx.Network.Socket{socket: socket}), do: socket
 
   defp broker_to_telemetry_info(nil), do: %{}
   defp broker_to_telemetry_info(broker), do: %{node_id: broker.node_id, host: broker.host, port: broker.port}

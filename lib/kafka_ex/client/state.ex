@@ -21,7 +21,8 @@ defmodule KafkaEx.Client.State do
     use_ssl: false,
     api_versions: %{},
     allow_auto_topic_creation: true,
-    metadata_timer_ref: nil
+    metadata_timer_ref: nil,
+    pending: %{}
   )
 
   @type t :: %__MODULE__{
@@ -37,7 +38,20 @@ defmodule KafkaEx.Client.State do
           use_ssl: boolean(),
           api_versions: map(),
           allow_auto_topic_creation: boolean(),
-          metadata_timer_ref: reference() | nil
+          metadata_timer_ref: reference() | nil,
+          pending: %{term() => :queue.queue(pending_entry())}
+        }
+
+  @typedoc """
+  A request sent on a broker socket whose response has not been read yet. The
+  caller is answered with `{:kafka_ex_response, ref, result}`; `request` is
+  what deserialises the response frame.
+  """
+  @type pending_entry :: %{
+          correlation_id: integer(),
+          ref: reference(),
+          caller: pid(),
+          request: map()
         }
 
   @default_metadata_update_interval 30_000
@@ -115,4 +129,60 @@ defmodule KafkaEx.Client.State do
       nil -> default
     end
   end
+
+  # ------------------------------------------------------------------
+  # Pipelined requests outstanding per broker socket, oldest first. The key is
+  # the raw socket carried by the `{:tcp | :ssl, socket, frame}` message, so a
+  # frame can be routed without a broker lookup.
+  # ------------------------------------------------------------------
+
+  def push_pending(%__MODULE__{pending: pending} = state, socket, entry) do
+    key = socket_key(socket)
+    queue = Map.get(pending, key, :queue.new())
+    %{state | pending: Map.put(pending, key, :queue.in(entry, queue))}
+  end
+
+  def peek_pending(%__MODULE__{pending: pending}, socket) do
+    with queue when not is_nil(queue) <- Map.get(pending, socket_key(socket)),
+         {:value, entry} <- :queue.peek(queue) do
+      entry
+    else
+      _ -> nil
+    end
+  end
+
+  def drop_pending(%__MODULE__{pending: pending} = state, socket) do
+    key = socket_key(socket)
+
+    case Map.get(pending, key) do
+      nil ->
+        state
+
+      queue ->
+        case :queue.out(queue) do
+          {{:value, _}, rest} -> %{state | pending: put_pending(pending, key, rest)}
+          {:empty, _} -> %{state | pending: Map.delete(pending, key)}
+        end
+    end
+  end
+
+  @doc """
+  Removes and returns every request outstanding on `socket`, oldest first.
+  """
+  def take_pending(%__MODULE__{pending: pending} = state, socket) do
+    {queue, rest} = Map.pop(pending, socket_key(socket))
+    entries = if queue, do: :queue.to_list(queue), else: []
+    {entries, %{state | pending: rest}}
+  end
+
+  def pending?(%__MODULE__{pending: pending}, socket), do: Map.has_key?(pending, socket_key(socket))
+
+  def pending_sockets(%__MODULE__{pending: pending}), do: Map.keys(pending)
+
+  defp put_pending(pending, key, queue) do
+    if :queue.is_empty(queue), do: Map.delete(pending, key), else: Map.put(pending, key, queue)
+  end
+
+  defp socket_key(%KafkaEx.Network.Socket{socket: raw}), do: raw
+  defp socket_key(raw), do: raw
 end
