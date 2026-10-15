@@ -2,6 +2,8 @@ defmodule KafkaEx.Consumer.StreamTest do
   use ExUnit.Case, async: true
 
   alias KafkaEx.Consumer.Stream
+  alias KafkaEx.Messages.Fetch
+  alias KafkaEx.Test.MockClient
 
   describe "struct" do
     test "has default values" do
@@ -37,6 +39,24 @@ defmodule KafkaEx.Consumer.StreamTest do
       assert stream.no_wait_at_logend == true
       assert stream.fetch_options == [max_bytes: 1024]
       assert stream.api_versions == %{fetch: 3, offset_fetch: 1, offset_commit: 2}
+    end
+  end
+
+  describe "a fetch whose records were all filtered out" do
+    test "moves the stream past them" do
+      record = %KafkaEx.Messages.Fetch.Record{offset: 3, value: "committed", topic: "t", partition: 0}
+
+      # Offsets 0..2 hold only an aborted transaction and its marker.
+      fetch = fn
+        0 -> {:ok, %Fetch{topic: "t", partition: 0, records: [], high_watermark: 4, last_offset: 2}}
+        3 -> {:ok, %Fetch{topic: "t", partition: 0, records: [record], high_watermark: 4, last_offset: 3}}
+        offset -> raise "fetched offset #{offset} again"
+      end
+
+      {:ok, client} = MockClient.start_link(%{fetch: fetch})
+      stream = %Stream{client: client, topic: "t", partition: 0, offset: 0}
+
+      assert Enum.take(stream, 1) == [record]
     end
   end
 

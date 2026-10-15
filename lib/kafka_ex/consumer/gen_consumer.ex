@@ -797,6 +797,13 @@ defmodule KafkaEx.Consumer.GenConsumer do
   end
 
   # Handle response from the new KafkaExAPI.fetch
+  # A read-committed fetch may hold only aborted records and markers: no
+  # records, yet the consumer moves past what it covered.
+  defp handle_new_fetch_response(%{records: [], last_offset: last_offset}, %State{} = state)
+       when is_integer(last_offset) do
+    handle_commit(:async_commit, %State{state | acked_offset: last_offset + 1, current_offset: last_offset + 1})
+  end
+
   defp handle_new_fetch_response(%{records: []} = _fetch_result, state) do
     # No messages, just handle async commit
     handle_commit(:async_commit, state)

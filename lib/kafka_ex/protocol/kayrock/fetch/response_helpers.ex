@@ -14,6 +14,9 @@ defmodule KafkaEx.Protocol.Kayrock.Fetch.ResponseHelpers do
 
   alias Kayrock.ErrorCode
 
+  @transactional 0x10
+  @control 0x20
+
   @doc """
   Extracts the first topic and partition response from a Fetch response.
 
@@ -218,6 +221,60 @@ defmodule KafkaEx.Protocol.Kayrock.Fetch.ResponseHelpers do
       {:error, _} = error -> error
     end
   end
+
+  @doc """
+  Parses a read-committed fetch (`isolation_level: 1`): control batches and the
+  batches of aborted transactions are dropped, as the Java consumer does.
+  `last_offset` still covers every batch, so a consumer moves past them.
+  """
+  @spec parse_committed(map()) :: {:ok, Fetch.t()} | {:error, Error.t()}
+  def parse_committed(response) do
+    with {:ok, fetch} <- KafkaEx.Protocol.Kayrock.Fetch.Response.parse_response(response) do
+      {:ok, keep_committed(fetch, response)}
+    end
+  end
+
+  defp keep_committed(fetch, response) do
+    case extract_first_partition_response(response) do
+      {:ok, _topic, %{record_set: [_ | _] = batches} = partition_resp} ->
+        aborted = get_in(partition_resp, [:partition_header, :aborted_transactions]) || []
+        records = batches |> committed_batches(aborted) |> convert_records(fetch.topic, fetch.partition)
+        %{fetch | records: records, last_offset: batch_last_offset(List.last(batches))}
+
+      _ ->
+        fetch
+    end
+  end
+
+  # As the Java consumer's CompletedFetch: an aborted transaction counts from
+  # the first batch reaching its first offset until that producer's ABORT
+  # marker; its transactional batches and every control batch are dropped.
+  defp committed_batches(batches, aborted_transactions) do
+    pending = Enum.sort_by(aborted_transactions, & &1.first_offset)
+
+    {kept, _pending, _aborted} =
+      Enum.reduce(batches, {[], pending, MapSet.new()}, fn batch, {kept, pending, aborted} ->
+        {started, pending} = Enum.split_while(pending, &(&1.first_offset <= batch_last_offset(batch)))
+        aborted = Enum.into(started, aborted, & &1.producer_id)
+
+        cond do
+          flag?(batch, @control) and abort_marker?(batch) -> {kept, pending, MapSet.delete(aborted, batch.producer_id)}
+          flag?(batch, @control) -> {kept, pending, aborted}
+          flag?(batch, @transactional) and MapSet.member?(aborted, batch.producer_id) -> {kept, pending, aborted}
+          true -> {[batch | kept], pending, aborted}
+        end
+      end)
+
+    Enum.reverse(kept)
+  end
+
+  defp batch_last_offset(batch), do: batch.batch_offset + batch.last_offset_delta
+
+  defp flag?(%{attributes: attributes}, bit), do: Bitwise.band(attributes, bit) != 0
+
+  # A control record's key is a version and a type: 0 is ABORT, 1 is COMMIT.
+  defp abort_marker?(%{records: [%{key: <<_version::16, 0::16, _::binary>>} | _]}), do: true
+  defp abort_marker?(_batch), do: false
 
   # Private helpers for extracting timestamp type from attributes
 

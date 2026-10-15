@@ -70,8 +70,14 @@ defmodule KafkaEx.Test.MockClient do
     {:reply, response, record_call(state, {:produce, topic, partition, messages})}
   end
 
+  # `fetch:` may also be a function of the requested offset.
   def handle_call({:fetch, topic, partition, offset, _opts}, _from, state) do
-    response = Map.get(state.responses, :fetch, {:ok, %Fetch{}})
+    response =
+      case Map.get(state.responses, :fetch, {:ok, %Fetch{}}) do
+        answer when is_function(answer, 1) -> answer.(offset)
+        answer -> answer
+      end
+
     {:reply, response, record_call(state, {:fetch, topic, partition, offset})}
   end
 

@@ -15,6 +15,21 @@ defmodule KafkaEx.TestHelpers do
   end
 
   @doc """
+  Opens a connected TCP pair on localhost that stands in for one broker
+  connection: `socket` is the client side (active, so frames reach the
+  calling process) and `server` the broker side. Everything closes when the
+  test exits.
+  """
+  def broker_socket_pair do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: true])
+    {:ok, server} = :gen_tcp.accept(listen, 2_000)
+    ExUnit.Callbacks.on_exit(fn -> Enum.each([server, socket, listen], &:gen_tcp.close/1) end)
+    %{listen: listen, port: port, socket: socket, server: server}
+  end
+
+  @doc """
   Returns a random port number that is not in use.
   """
   def get_free_port(port) do

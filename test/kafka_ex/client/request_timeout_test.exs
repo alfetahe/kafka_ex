@@ -23,19 +23,14 @@ defmodule KafkaEx.Client.RequestTimeoutTest do
     previous = Application.fetch_env(:kafka_ex, :sync_timeout)
     Application.put_env(:kafka_ex, :sync_timeout, @sync_timeout)
 
-    {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: false, reuseaddr: true])
-    {:ok, port} = :inet.port(listen)
-    {:ok, client} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: true])
-    {:ok, server} = :gen_tcp.accept(listen, 2_000)
-
     on_exit(fn ->
       case previous do
         {:ok, value} -> Application.put_env(:kafka_ex, :sync_timeout, value)
         :error -> Application.delete_env(:kafka_ex, :sync_timeout)
       end
-
-      Enum.each([server, client, listen], &:gen_tcp.close/1)
     end)
+
+    %{listen: listen, socket: client, server: server, port: port} = KafkaEx.TestHelpers.broker_socket_pair()
 
     %{listen: listen, server: server, state: state_for(client, port)}
   end

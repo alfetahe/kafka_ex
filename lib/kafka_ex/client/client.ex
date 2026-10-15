@@ -788,7 +788,8 @@ defmodule KafkaEx.Client do
   end
 
   defp handle_fetch_request(request, node_selector, state) do
-    handle_request_with_retry(request, &ResponseParser.fetch_response/1, node_selector, state)
+    isolation_level = Map.get(request, :isolation_level, 0)
+    handle_request_with_retry(request, &ResponseParser.fetch_response(&1, isolation_level), node_selector, state)
   end
 
   defp handle_find_coordinator_request(request, node_selector, state) do

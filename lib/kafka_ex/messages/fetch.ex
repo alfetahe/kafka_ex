@@ -94,12 +94,13 @@ defmodule KafkaEx.Messages.Fetch do
 
   Kafka may return full RecordBatches that include records before the requested
   offset. This function trims those pre-offset records, matching the behavior
-  of the Java Kafka client.
+  of the Java Kafka client. `last_offset` is kept unless it lies before
+  `offset`: a read-committed fetch may cover offsets it hands no record for.
   """
   @spec filter_from_offset(t(), non_neg_integer()) :: t()
   def filter_from_offset(%__MODULE__{} = fetch, offset) do
     filtered = Enum.filter(fetch.records, &(&1.offset >= offset))
-    last = compute_last_offset(filtered, nil)
+    last = if fetch.last_offset && fetch.last_offset >= offset, do: fetch.last_offset
     %{fetch | records: filtered, last_offset: last}
   end
 

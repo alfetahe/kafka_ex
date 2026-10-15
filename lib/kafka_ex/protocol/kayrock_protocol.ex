@@ -154,6 +154,7 @@ defmodule KafkaEx.Protocol.KayrockProtocol do
   def parse_response(:metadata, response), do: KayrockProtocol.Metadata.Response.parse_response(response)
   def parse_response(:produce, response), do: KayrockProtocol.Produce.Response.parse_response(response)
   def parse_response(:fetch, response), do: KayrockProtocol.Fetch.Response.parse_response(response)
+  def parse_response(:fetch_committed, response), do: KayrockProtocol.Fetch.ResponseHelpers.parse_committed(response)
   def parse_response(:find_coordinator, response), do: KayrockProtocol.FindCoordinator.Response.parse_response(response)
   def parse_response(:create_topics, response), do: KayrockProtocol.CreateTopics.Response.parse_response(response)
   def parse_response(:delete_topics, response), do: KayrockProtocol.DeleteTopics.Response.parse_response(response)

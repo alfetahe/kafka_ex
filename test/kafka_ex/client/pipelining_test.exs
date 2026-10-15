@@ -11,17 +11,7 @@ defmodule KafkaEx.Client.PipeliningTest do
   @node_id 1
 
   setup do
-    {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: 4, active: false, reuseaddr: true])
-    {:ok, port} = :inet.port(listen)
-    {:ok, client} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: true])
-    {:ok, server} = :gen_tcp.accept(listen, 2_000)
-
-    on_exit(fn ->
-      :gen_tcp.close(server)
-      :gen_tcp.close(client)
-      :gen_tcp.close(listen)
-    end)
-
+    %{socket: client, server: server, port: port} = KafkaEx.TestHelpers.broker_socket_pair()
     %{client: client, server: server, port: port, state: state_for(client, port)}
   end
 

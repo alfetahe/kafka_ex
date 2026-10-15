@@ -109,12 +109,13 @@ defmodule KafkaEx.Client.ResponseParser do
   end
 
   @doc """
-  Parses response for Fetch API
+  Parses response for Fetch API, made with the given `isolation_level`
+  (1 is read committed).
   """
-  @spec fetch_response(term) :: {:ok, Fetch.t()} | {:error, Error.t()}
-  def fetch_response(response) do
-    @protocol.parse_response(:fetch, response)
-  end
+  @spec fetch_response(term, 0 | 1) :: {:ok, Fetch.t()} | {:error, Error.t()}
+  def fetch_response(response, isolation_level \\ 0)
+  def fetch_response(response, 1), do: @protocol.parse_response(:fetch_committed, response)
+  def fetch_response(response, _isolation_level), do: @protocol.parse_response(:fetch, response)
 
   @doc """
   Parses response for FindCoordinator API

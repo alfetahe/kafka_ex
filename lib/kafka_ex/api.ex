@@ -816,7 +816,9 @@ defmodule KafkaEx.API do
     * `:max_bytes` - Maximum bytes to fetch per partition (default: 1,000,000)
     * `:max_wait_time` - Maximum time to wait for records in ms (default: 10,000)
     * `:min_bytes` - Minimum bytes to accumulate before returning (default: 1)
-    * `:isolation_level` - 0 for READ_UNCOMMITTED, 1 for READ_COMMITTED (V4+, default: 0)
+    * `:isolation_level` - 0 for READ_UNCOMMITTED, 1 for READ_COMMITTED (V4+, default: 0).
+      READ_COMMITTED leaves out the records of aborted transactions and the
+      transaction markers; `last_offset` still covers them.
     * `:api_version` - API version to use (default: 3)
 
   ## Examples
