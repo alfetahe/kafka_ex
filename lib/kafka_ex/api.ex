@@ -492,6 +492,9 @@ defmodule KafkaEx.API do
     - **V1**: Adds separate rebalance_timeout field
     - **V2**: Adds throttle_time_ms to response
 
+  The `:timeout` option bounds the wait for the broker's answer, which the
+  broker holds for the rebalance (default: `:rebalance_timeout` + 10 seconds).
+
   ## Examples
 
       {:ok, result} = KafkaEx.API.join_group(client, "my-group", "")
@@ -500,9 +503,9 @@ defmodule KafkaEx.API do
   @spec join_group(client, consumer_group_name, member_id, opts) :: {:ok, JoinGroup.t()} | {:error, error_atom}
   def join_group(client, consumer_group, member_id, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, Keyword.get(opts, :rebalance_timeout, 60_000) + 10_000)
-    call_opts = Keyword.delete(opts, :timeout)
+    call_opts = Keyword.put(opts, :timeout, timeout)
 
-    case GenServer.call(client, {:join_group, consumer_group, member_id, call_opts}, timeout) do
+    case GenServer.call(client, {:join_group, consumer_group, member_id, call_opts}, Client.call_timeout(timeout)) do
       {:ok, result} -> {:ok, result}
       {:error, %{error: error_atom}} -> {:error, error_atom}
       {:error, error_atom} -> {:error, error_atom}
@@ -517,6 +520,9 @@ defmodule KafkaEx.API do
   assignments which are distributed to all members. Followers receive their
   assigned partitions from this call.
 
+  The `:timeout` option bounds the wait for the broker's answer (default: 35
+  seconds).
+
   ## Examples
 
       {:ok, result} = KafkaEx.API.sync_group(client, "my-group", gen_id, member_id, assignments: assignments)
@@ -527,9 +533,13 @@ defmodule KafkaEx.API do
   def sync_group(client, consumer_group, generation_id, member_id, opts \\ []) do
     # SyncGroup can block until all members sync or session_timeout
     timeout = Keyword.get(opts, :timeout, 35_000)
-    call_opts = Keyword.delete(opts, :timeout)
+    call_opts = Keyword.put(opts, :timeout, timeout)
 
-    case GenServer.call(client, {:sync_group, consumer_group, generation_id, member_id, call_opts}, timeout) do
+    case GenServer.call(
+           client,
+           {:sync_group, consumer_group, generation_id, member_id, call_opts},
+           Client.call_timeout(timeout)
+         ) do
       {:ok, result} -> {:ok, result}
       {:error, %{error: error_atom}} -> {:error, error_atom}
       {:error, error_atom} -> {:error, error_atom}

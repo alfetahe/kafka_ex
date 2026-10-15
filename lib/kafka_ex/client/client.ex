@@ -49,11 +49,14 @@ defmodule KafkaEx.Client do
   @doc """
   Send a Kayrock request to the appropriate broker
   Broker metadata will be updated if necessary
+
+  `timeout` bounds the wait for the broker's response (default: the
+  `:sync_timeout` setting).
   """
   @spec send_request(KafkaEx.API.client(), map, KafkaEx.Client.NodeSelector.t(), pos_integer | nil) ::
           {:ok, term} | {:error, term}
   def send_request(server, request, node_selector, timeout \\ nil) do
-    GenServer.call(server, {:kayrock_request, request, node_selector}, timeout_val(timeout))
+    GenServer.call(server, {:kayrock_request, request, node_selector, timeout}, call_timeout(timeout))
   end
 
   @doc """
@@ -81,6 +84,7 @@ defmodule KafkaEx.Client do
   @default_call_timeout 5_000
   @retry_count 3
   @sync_timeout 1_000
+  @reply_margin_ms 1_000
   @reconnect_max_retries 3
   @reconnect_delay_ms 500
 
@@ -350,8 +354,8 @@ defmodule KafkaEx.Client do
     end
   end
 
-  def handle_call({:kayrock_request, request, node_selector}, _from, state) do
-    {response, updated_state} = kayrock_network_request(request, node_selector, state)
+  def handle_call({:kayrock_request, request, node_selector, timeout}, _from, state) do
+    {response, updated_state} = kayrock_network_request(request, node_selector, state, timeout)
 
     {:reply, response, updated_state}
   end
@@ -531,7 +535,7 @@ defmodule KafkaEx.Client do
     req_data = [{:group_id, consumer_group}, {:member_id, member_id} | opts]
 
     with {:ok, request} <- RequestBuilder.join_group_request(req_data, state),
-         {{:ok, result}, updated_state} <- handle_join_group_request(request, node_selector, state) do
+         {{:ok, result}, updated_state} <- handle_join_group_request(request, node_selector, state, opts[:timeout]) do
       stop_metadata = add_join_group_result_metadata(metadata, result)
       {{{:ok, result}, updated_state}, stop_metadata}
     else
@@ -584,7 +588,7 @@ defmodule KafkaEx.Client do
     req_data = [{:group_id, consumer_group}, {:generation_id, generation_id}, {:member_id, member_id} | opts]
 
     with {:ok, request} <- RequestBuilder.sync_group_request(req_data, state),
-         {{:ok, result}, updated_state} <- handle_sync_group_request(request, node_selector, state) do
+         {{:ok, result}, updated_state} <- handle_sync_group_request(request, node_selector, state, opts[:timeout]) do
       assigned_partitions = count_assigned_partitions(result.partition_assignments)
       stop_metadata = Map.put(metadata, :assigned_partitions, assigned_partitions)
       {{{:ok, result}, updated_state}, stop_metadata}
@@ -758,16 +762,16 @@ defmodule KafkaEx.Client do
     handle_request_with_retry(request, &ResponseParser.heartbeat_response/1, node_selector, state)
   end
 
-  defp handle_join_group_request(request, node_selector, state) do
-    handle_request_with_retry(request, &ResponseParser.join_group_response/1, node_selector, state)
+  defp handle_join_group_request(request, node_selector, state, timeout) do
+    handle_request_with_retry(request, &ResponseParser.join_group_response/1, node_selector, state, timeout: timeout)
   end
 
   defp handle_leave_group_request(request, node_selector, state) do
     handle_request_with_retry(request, &ResponseParser.leave_group_response/1, node_selector, state)
   end
 
-  defp handle_sync_group_request(request, node_selector, state) do
-    handle_request_with_retry(request, &ResponseParser.sync_group_response/1, node_selector, state)
+  defp handle_sync_group_request(request, node_selector, state, timeout) do
+    handle_request_with_retry(request, &ResponseParser.sync_group_response/1, node_selector, state, timeout: timeout)
   end
 
   defp handle_produce_request(request, node_selector, state) do
@@ -779,8 +783,7 @@ defmodule KafkaEx.Client do
       &ResponseParser.produce_response/1,
       node_selector,
       state,
-      @retry_count,
-      &Retry.produce_retryable?/1
+      retryable?: &Retry.produce_retryable?/1
     )
   end
 
@@ -812,71 +815,79 @@ defmodule KafkaEx.Client do
   end
 
   # ----------------------------------------------------------------------------------------------------
-  # Request retry logic with optional retryable filter
+  # Request retry logic with optional retryable filter and timeout
   #
-  # The `retryable?` parameter allows callers to specify which errors should trigger a retry.
+  # The `:retryable?` option allows callers to specify which errors should trigger a retry.
   # This is important for produce requests where blind retries can cause duplicate messages.
   # By default, all errors are retried (backwards compatible behavior).
   #
   # For produce requests, use `&Retry.produce_retryable?/1` to only retry leadership errors.
+  #
+  # A `:timeout` bounds the request, retries included, in place of `:sync_timeout`: each
+  # attempt waits for what is left of it, and none starts once it is spent.
   # ----------------------------------------------------------------------------------------------------
-  defp handle_request_with_retry(
-         request,
-         parser_fn,
-         node_selector,
-         state,
-         retry_count \\ @retry_count,
-         retryable? \\ fn _ -> true end,
-         last_error \\ nil
-       )
+  defp handle_request_with_retry(request, parser_fn, node_selector, state, opts \\ []) do
+    policy = %{
+      retryable?: Keyword.get(opts, :retryable?, fn _ -> true end),
+      deadline: opts[:timeout] && System.monotonic_time(:millisecond) + opts[:timeout]
+    }
 
-  defp handle_request_with_retry(_, _, _, state, 0, _retryable?, last_error) do
+    retry_request(request, parser_fn, node_selector, state, @retry_count, policy, nil)
+  end
+
+  defp retry_request(_, _, _, state, 0, _policy, last_error) do
     {{:error, last_error}, state}
   end
 
-  defp handle_request_with_retry(request, parser_fn, node_selector, state, retry_count, retryable?, _last_error) do
-    case kayrock_network_request(request, node_selector, state) do
+  defp retry_request(request, parser_fn, node_selector, state, retry_count, policy, _last_error) do
+    case kayrock_network_request(request, node_selector, state, time_left(policy.deadline)) do
       {{:ok, response}, state_out} ->
         case parser_fn.(response) do
           {:ok, result} ->
             {{:ok, result}, state_out}
 
           {:error, [error | _]} ->
-            handle_request_error(request, parser_fn, node_selector, state, retry_count, retryable?, error)
+            handle_request_error(request, parser_fn, node_selector, state, retry_count, policy, error)
 
           {:error, %Error{} = error} ->
-            handle_request_error(request, parser_fn, node_selector, state, retry_count, retryable?, error)
+            handle_request_error(request, parser_fn, node_selector, state, retry_count, policy, error)
         end
 
       {_, _state_out} ->
         error = Error.build(:unknown, %{})
-        handle_request_error(request, parser_fn, node_selector, state, retry_count, retryable?, error)
+        handle_request_error(request, parser_fn, node_selector, state, retry_count, policy, error)
     end
   end
 
-  defp handle_request_error(request, parser_fn, node_selector, state, retry_count, retryable?, error) do
+  defp handle_request_error(request, parser_fn, node_selector, state, retry_count, policy, error) do
     request_name = request.__struct__
     error_atom = extract_error_atom(error)
     Logger.warning("Request #{inspect(request_name)} failed with error #{inspect(error_atom)}")
 
-    # Check if this error is retryable
-    if retryable?.(error_atom) do
-      # Refresh metadata for leadership-related errors before retrying
-      updated_state =
-        if requires_metadata_refresh?(error_atom) do
-          Logger.info("Refreshing metadata due to #{inspect(error_atom)} error")
-          update_metadata(state)
-        else
-          state
-        end
+    cond do
+      time_left(policy.deadline) == 0 ->
+        {{:error, error}, state}
 
-      handle_request_with_retry(request, parser_fn, node_selector, updated_state, retry_count - 1, retryable?, error)
-    else
-      # Non-retryable error - fail immediately
-      Logger.info("Error #{inspect(error_atom)} is not retryable for #{inspect(request_name)}, failing immediately")
-      {{:error, error}, state}
+      policy.retryable?.(error_atom) ->
+        # Refresh metadata for leadership-related errors before retrying
+        updated_state =
+          if requires_metadata_refresh?(error_atom) do
+            Logger.info("Refreshing metadata due to #{inspect(error_atom)} error")
+            update_metadata(state)
+          else
+            state
+          end
+
+        retry_request(request, parser_fn, node_selector, updated_state, retry_count - 1, policy, error)
+
+      true ->
+        Logger.info("Error #{inspect(error_atom)} is not retryable for #{inspect(request_name)}, failing immediately")
+        {{:error, error}, state}
     end
   end
+
+  defp time_left(nil), do: nil
+  defp time_left(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   defp extract_error_atom(%Error{error: error}), do: error
   defp extract_error_atom(error) when is_atom(error), do: error
@@ -1152,6 +1163,12 @@ defmodule KafkaEx.Client do
 
   defp timeout_val(nil), do: Application.get_env(:kafka_ex, :sync_timeout, @default_call_timeout)
   defp timeout_val(timeout) when is_integer(timeout), do: timeout
+
+  @doc false
+  # How long a caller waits on a request the client bounds by `timeout`: a margin
+  # longer, so the client's own answer, a timeout error included, reaches it first.
+  @spec call_timeout(pos_integer | nil) :: pos_integer
+  def call_timeout(timeout), do: timeout_val(timeout) + @reply_margin_ms
 
   defp config_sync_timeout(timeout \\ nil) do
     timeout || Application.get_env(:kafka_ex, :sync_timeout, @sync_timeout)

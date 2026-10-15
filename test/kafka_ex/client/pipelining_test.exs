@@ -145,7 +145,7 @@ defmodule KafkaEx.Client.PipeliningTest do
     responder = answer_after_next_request(ctx.server, [response_frame(corr_a), response_frame(corr_sync)])
 
     {:reply, reply, state} =
-      Client.handle_call({:kayrock_request, request(), selector()}, {self(), make_ref()}, state)
+      Client.handle_call({:kayrock_request, request(), selector(), nil}, {self(), make_ref()}, state)
 
     assert {:ok, %Kayrock.ApiVersions.V0.Response{correlation_id: ^corr_sync}} = reply
     assert_received :answered
@@ -165,7 +165,7 @@ defmodule KafkaEx.Client.PipeliningTest do
     responder = answer_after_next_request(ctx.server, [response_frame(100)])
 
     {:reply, reply, state} =
-      Client.handle_call({:kayrock_request, request(), selector()}, {self(), make_ref()}, ctx.state)
+      Client.handle_call({:kayrock_request, request(), selector(), nil}, {self(), make_ref()}, ctx.state)
 
     assert {:ok, %Kayrock.ApiVersions.V0.Response{correlation_id: 100}} = reply
     assert {:ok, [active: true]} = :inet.getopts(ctx.client, [:active])
